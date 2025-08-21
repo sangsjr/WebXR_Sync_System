@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "WebXR Sync System (Plugin Version) - Phone",
+  "version": "0.1",
+  "description": "Real-time position sync between Phone and Quest",
+  "permissions": ["scripting", "activeTab", "webNavigation", "alarms", "tabs", "storage"],
+  
+  "host_permissions": [
+    "https://*/*",
+    "wss://*/*"
+  ],
+  
+  "background": {
+    "scripts": [
+      "lib/socket.io.min.js",
+      "lib/Listener.js",
+      "lib/WebRTCNetwork.js",
+      "lib/BushiSync.js",
+      "background.js"
+    ]
+  },
+  
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "WebXR Space Sync"
+  },
+  
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/*.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; object-src 'self'; connect-src 'self' https: wss:;"
+  },
+  
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "webxr-sync@hahademo.extension",
+      "strict_min_version": "54.0a1"
+    }
+  }
+}
