@@ -1,6 +1,6 @@
 # WebXR Sync System (Web Version)
 
-### Quick Start
+## Quick Start
 
 ##### 1. Configure IP Address
 
@@ -32,7 +32,7 @@ Vite will provide a local development URL (typically `https://your-ip:5173`).
 
 * Enter AR mode to begin the system
 
-### Common Issues
+## Common Issues
 
 1. **Connection Problems**
    
