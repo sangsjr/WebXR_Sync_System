@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>A-Frame WebXR Space Synchronization System</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+  <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+
+  <script  type="module">
+    import BushiSync from '/src/BushiSync.js';
+    let sync;
+
+    function initWebRTC() {
+      sync = new BushiSync({ host: "192.168.2.47:3001" });
+
+      // Record network latency every 10 samples from phone to Quest
+      let latencySamples = [];
+      // Record Quest receiving frequency
+      let recvCount = 0;
+      let lastRecvLog = Date.now();
+      sync.on('phone-position', (data, userId) => {
+        // console.log('Received phone position from user:', userId, data);
+        // Record Quest receiving frequency
+        recvCount++;
+        const now = Date.now();
+        if (now - lastRecvLog >= 1000) {
+          console.log(`Quest received ${recvCount} messages/sec from ${userId}`);
+          recvCount = 0;
+          lastRecvLog = now;
+        }
+        // Record network latency every 10 samples from phone to Quest
+        // const latency = now - data.timestamp;
+        const latency = performance.now() - data.timestamp;
+        latencySamples.push(latency);
+        if (latencySamples.length >= 10) {
+          const avg = latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length;
+          console.log(`Avg latency from ${userId}: ${avg.toFixed(1)} ms`);
+          latencySamples = [];
+        }
+
+        if (isQuest && phoneModel) {
+          const phonePosition = new THREE.Vector3(data.position.x, data.position.y, data.position.z);
+          const phoneRotation = new THREE.Euler(data.rotation.x, data.rotation.y, data.rotation.z);
+          const phoneQuaternion = new THREE.Quaternion().setFromEuler(phoneRotation);
+
+          if (transformMatrix) {
+            const transformedPosition = phonePosition.clone().applyMatrix4(transformMatrix);
+            const transformedQuaternion = phoneQuaternion.clone().premultiply(
+              new THREE.Quaternion().setFromRotationMatrix(transformMatrix)
+            );
+
+            phoneModel.setAttribute('position', {
+              x: transformedPosition.x,
+              y: transformedPosition.y,
+              z: transformedPosition.z
+            });
+            phoneModel.object3D.quaternion.copy(transformedQuaternion);
+          }
+        }
+      });
+    }
+
+    let isQuest = false; // Default to phone mode
+    let deviceSelected = false; // Mark whether the user has selected a device
+    let calibrationMode = false;
+    let transformMatrix = new THREE.Matrix4(); // Transformation matrix
+    let socket;
+    let controllerEl;
+    let phoneModel;
+    let roomId = '';
+    let connected = false;
+
+    // Statistics for sending message frequency
+    let sendCount = 0;
+    let lastSendLog = Date.now();
+
+    function sendPhonePositionWebRTC() {
+      if (isQuest || !connected || !deviceSelected || !sync) return;
+      const camera = document.querySelector('a-camera');
+      if (!camera) return;
+
+      const position = camera.object3D.position;
+      const rotation = new THREE.Euler().setFromQuaternion(camera.object3D.quaternion);
+
+      sync.send('phone-position', {
+        position: { x: position.x, y: position.y, z: position.z },
+        rotation: { x: rotation.x, y: rotation.y, z: rotation.z },
+        // timestamp: Date.now()
+        timestamp: performance.now()
+      });
+
+      // Count how many position messages are sent per second via WebRTC
+      sendCount++;
+      const now = Date.now();
+      if (now - lastSendLog >= 1000) {
+        console.log(`Phone sending ${sendCount} messages/sec`);
+        sendCount = 0;
+        lastSendLog = now;
+      }
+    }
+
+    // Generate a random room ID
+    function generateRoomId() {
+      return Math.random().toString(36).substring(2, 8).toUpperCase();
+    }
+
+    // Show status messages
+    function showStatus(message, isError = false) {
+      const statusMessage = document.getElementById('status-message');
+      if (statusMessage) {
+        statusMessage.textContent = message;
+        statusMessage.style.color = isError ? 'red' : 'white';
+      }
+    }
+
+    // Communication initialization: Establish Socket.IO connection
+    // Initialize Socket.IO connection
+    function initWebSocket() {
+      // Connect to Socket.IO server
+      socket = io('https://192.168.2.47:3001');
+      
+      
+      socket.on('connect', function() {
+        initWebRTC(); // Initialize WebRTC alongside Socket.IO
+        console.log('Socket.IO connected');
+        connected = true;
+
+        // Query room ID
+        if (!roomId) {
+          const urlParams = new URLSearchParams(window.location.search);
+          roomId = urlParams.get('room');
+
+          // If no room ID in URL, generate a new one
+          if (!roomId) {
+            roomId = generateRoomId();
+            // Update URL without reloading the page
+            window.history.pushState({}, '', `?room=${roomId}`);
+          }
+        }
+
+        // Update room ID display
+        const roomIdDisplay = document.getElementById('room-id-display');
+        if (roomIdDisplay) {
+          roomIdDisplay.textContent = `Room ID: ${roomId}`;
+        }
+
+        // Join room
+        socket.emit('join-room', {
+          roomId: roomId,
+          device: isQuest ? 'quest' : 'phone'
+        });
+        
+        showStatus(`Connected to server. Room ID: ${roomId}`);
+      });
+      
+      socket.on('disconnect', function() {
+        console.log('Socket.IO disconnected');
+        connected = false;
+        showStatus('Disconnected from server. Trying to reconnect...', true);
+      });
+      
+      socket.on('room-joined', function(data) {
+        console.log('Joined room', data);
+        showStatus(`Joined room ${data.roomId} as ${data.deviceType}`);
+        
+        if (data.otherDeviceConnected) {
+          showStatus(`The other device is already connected to room ${data.roomId}`);
+        } else {
+          showStatus(`Waiting for the other device to connect to room ${data.roomId}...`);
+        }
+
+        // If Quest device, request stored transformation matrix
+        if (isQuest) {
+          socket.emit('get-transform-matrix');
+        }
+      });
+      
+      socket.on('device-connected', function(data) {
+        console.log('Device connected:', data);
+        showStatus(`${data.deviceType} device connected`);
+      });
+      
+      socket.on('device-disconnected', function(data) {
+        console.log('Device disconnected:', data);
+        showStatus(`${data.deviceType} device disconnected`, true);
+      });
+      
+      socket.on('phone-position', function(data) {
+        if (isQuest && phoneModel && !calibrationMode) {
+          // Receive phone position data on Quest and apply it (only when not in calibration mode)
+          const phonePosition = new THREE.Vector3(data.position.x, data.position.y, data.position.z);
+          const phoneRotation = new THREE.Euler(data.rotation.x, data.rotation.y, data.rotation.z);
+          const phoneQuaternion = new THREE.Quaternion().setFromEuler(phoneRotation);
+      
+          // Apply transformation matrix if calibrated
+          if (transformMatrix) {
+            const transformedPosition = phonePosition.clone().applyMatrix4(transformMatrix);
+            const transformedQuaternion = phoneQuaternion.clone().premultiply(
+              new THREE.Quaternion().setFromRotationMatrix(transformMatrix)
+            );
+      
+            // Update phone model position and rotation
+            phoneModel.setAttribute('position', {
+              x: transformedPosition.x,
+              y: transformedPosition.y,
+              z: transformedPosition.z
+            });
+            
+            phoneModel.object3D.quaternion.copy(transformedQuaternion);
+          }
+        }
+      });
+      
+      socket.on('transform-matrix', function(data) {
+        if (isQuest && data.matrix) {
+          console.log('Received stored transform matrix');
+          transformMatrix = new THREE.Matrix4().fromArray(data.matrix);
+          showStatus('Transform matrix loaded from server');
+        }
+      });
+      
+      socket.on('send-calibration-data', function() {
+        if (!isQuest) {
+          console.log('Received calibration request');
+          showStatus('Calibration requested. Sending data...');
+
+          // Getting the camera position and rotation
+          const camera = document.querySelector('a-camera');
+          const position = camera.object3D.position;
+          const rotation = new THREE.Euler().setFromQuaternion(camera.object3D.quaternion);
+
+          // Send calibration data
+          socket.emit('calibration-data', {
+            position: {
+              x: position.x,
+              y: position.y,
+              z: position.z
+            },
+            rotation: {
+              x: rotation.x,
+              y: rotation.y,
+              z: rotation.z
+            },
+            timestamp: Date.now()
+          });
+        }
+      });
+      
+      socket.on('calibration-data', function(data) {
+        if (isQuest && calibrationMode) {
+          console.log('Received calibration data from phone');
+          
+          const phonePosition = new THREE.Vector3(data.position.x, data.position.y, data.position.z);
+          const phoneRotation = new THREE.Euler(data.rotation.x, data.rotation.y, data.rotation.z);
+          const phoneQuaternion = new THREE.Quaternion().setFromEuler(phoneRotation);
+
+          // Get controller position and rotation
+          const controllerPosition = new THREE.Vector3();
+          const controllerQuaternion = new THREE.Quaternion();
+          controllerEl.object3D.getWorldPosition(controllerPosition);
+          controllerEl.object3D.getWorldQuaternion(controllerQuaternion);
+
+          const controllerForward = new THREE.Vector3(0, 0, -1).applyQuaternion(controllerQuaternion);
+          
+          const phoneForward = new THREE.Vector3(0, 0, -1).applyQuaternion(phoneQuaternion);
+          
+          const alignmentQuaternion = new THREE.Quaternion().setFromUnitVectors(controllerForward, phoneForward);
+          
+          const alignedControllerQuaternion = controllerQuaternion.clone().premultiply(alignmentQuaternion);
+
+          // Compute transformation matrix
+          const phoneWorldMatrix = new THREE.Matrix4().compose(
+            phonePosition,
+            phoneQuaternion,
+            new THREE.Vector3(1, 1, 1)
+          );
+          
+          const controllerWorldMatrix = new THREE.Matrix4().compose(
+            controllerPosition,
+            alignedControllerQuaternion,
+            new THREE.Vector3(1, 1, 1)
+          );
+
+          // Compute transformation from phone space to controller space
+          const phoneInverse = new THREE.Matrix4().copy(phoneWorldMatrix).invert();
+          transformMatrix = new THREE.Matrix4().multiplyMatrices(controllerWorldMatrix, phoneInverse);
+          
+          console.log('Calibration complete, transform matrix created');
+
+          // Store transformation matrix on server
+          socket.emit('store-transform-matrix', {
+            matrix: transformMatrix.toArray()
+          });
+
+          // Remove calibration prompt
+          const calibrationText = document.querySelector('#calibration-text');
+          if (calibrationText) {
+            calibrationText.parentNode.removeChild(calibrationText);
+          }
+
+          // Show calibration successful message
+          showStatus('Calibration successful!');
+
+          // Create success message
+          const successText = document.createElement('a-entity');
+          successText.setAttribute('text', {
+            value: 'Calibration successful!',
+            color: 'green',
+            align: 'center',
+            width: 1
+          });
+          successText.setAttribute('position', '0 1.8 -1');
+          successText.setAttribute('id', 'success-text');
+          document.querySelector('a-scene').appendChild(successText);
+
+          // Remove success message after 3 seconds
+          setTimeout(() => {
+            const successTextEl = document.querySelector('#success-text');
+            if (successTextEl) {
+              successTextEl.parentNode.removeChild(successTextEl);
+            }
+          }, 3000);
+          
+          // Apply final transformation to phone model and keep it visible
+          if (phoneModel && transformMatrix) {
+            // Apply the transformation matrix to position the phone model correctly
+            const finalPosition = new THREE.Vector3();
+            const finalQuaternion = new THREE.Quaternion();
+            const finalScale = new THREE.Vector3();
+            transformMatrix.decompose(finalPosition, finalQuaternion, finalScale);
+            
+            phoneModel.object3D.position.copy(finalPosition);
+            phoneModel.object3D.quaternion.copy(finalQuaternion);
+            phoneModel.setAttribute('visible', true);
+            
+            // Switch back to edge guide after calibration
+            if (phoneModel.solidBox && phoneModel.edgeGuide) {
+              phoneModel.solidBox.setAttribute('visible', false);
+              phoneModel.edgeGuide.setAttribute('visible', true);
+            }
+          }
+          
+          calibrationMode = false;
+        }
+      });
+      
+      socket.on('calibration-complete', function(data) {
+        console.log('Calibration complete:', data);
+        if (!isQuest) {
+          showStatus('Calibration completed successfully!');
+        }
+      });
+    }
+    
+    function initDevice() {
+      if (!deviceSelected) {
+        console.log('Device not selected yet, skipping initialization');
+        return;
+      }
+      
+      console.log(`Initializing device as ${isQuest ? 'Quest' : 'Phone'}`);
+      const sceneEl = document.querySelector('a-scene');
+      
+      if (isQuest) {
+        console.log('Setting up Quest device');
+
+        // Quest device: Create controller and phone model
+        controllerEl = document.createElement('a-entity');
+        controllerEl.setAttribute('oculus-touch-controls', 'hand: right');
+        controllerEl.setAttribute('id', 'right-controller');
+        sceneEl.appendChild(controllerEl);
+        
+        if (controllerEl) {
+          controllerEl.addEventListener('triggerdown', startCalibration);
+        } else {
+          console.error('Controller element not found');
+        }
+        
+        phoneModel = document.createElement('a-entity');
+        phoneModel.setAttribute('id', 'phone-model');
+        phoneModel.setAttribute('visible', false); // Initially hidden
+        sceneEl.appendChild(phoneModel);
+
+
+        // Create solid box for calibration mode (initially hidden)
+        const solidBox = document.createElement('a-box');
+        solidBox.setAttribute('id', 'solid-box');
+        solidBox.setAttribute('width', 0.07);
+        solidBox.setAttribute('height', 0.15);
+        solidBox.setAttribute('depth', 0.01);
+        solidBox.setAttribute('position', '-0.08 0 0');
+        solidBox.setAttribute('material', 'color: #000000; opacity: 0.8; transparent: true');
+        solidBox.setAttribute('visible', false);
+        phoneModel.appendChild(solidBox);
+        
+        // Create alignment guide with edge-only outline (for after calibration)
+        const alignmentGuide = document.createElement('a-entity');
+        alignmentGuide.setAttribute('id', 'edge-guide');
+        alignmentGuide.setAttribute('position', '-0.08 0 0');  // Modify to negative value to position on the left
+        
+        // Create 12 edges of the box using thin cylinders
+        const width = 0.07, height = 0.15, depth = 0.005;  // Made thinner
+        const edgeRadius = 0.0005;  // Very thin edges
+        const edgeColor = '#666666';
+        const opacity = 0.7;
+        
+        // 4 vertical edges
+        for (let i = 0; i < 4; i++) {
+          const edge = document.createElement('a-cylinder');
+          const x = (i % 2) * width - width/2;
+          const z = Math.floor(i / 2) * depth - depth/2;
+          edge.setAttribute('radius', edgeRadius);
+          edge.setAttribute('height', height);
+          edge.setAttribute('position', `${x} 0 ${z}`);
+          edge.setAttribute('material', `color: ${edgeColor}; opacity: ${opacity}`);
+          alignmentGuide.appendChild(edge);
+        }
+        
+        // 4 horizontal edges (top)
+        for (let i = 0; i < 4; i++) {
+          const edge = document.createElement('a-cylinder');
+          const isWidthEdge = i < 2;
+          const length = isWidthEdge ? width : depth;
+          const x = isWidthEdge ? 0 : (i === 2 ? -width/2 : width/2);
+          const z = isWidthEdge ? (i === 0 ? -depth/2 : depth/2) : 0;
+          edge.setAttribute('radius', edgeRadius);
+          edge.setAttribute('height', length);
+          edge.setAttribute('position', `${x} ${height/2} ${z}`);
+          edge.setAttribute('rotation', isWidthEdge ? '0 0 90' : '0 90 90');
+          edge.setAttribute('material', `color: ${edgeColor}; opacity: ${opacity}`);
+          alignmentGuide.appendChild(edge);
+        }
+        
+        // 4 horizontal edges (bottom)
+        for (let i = 0; i < 4; i++) {
+          const edge = document.createElement('a-cylinder');
+          const isWidthEdge = i < 2;
+          const length = isWidthEdge ? width : depth;
+          const x = isWidthEdge ? 0 : (i === 2 ? -width/2 : width/2);
+          const z = isWidthEdge ? (i === 0 ? -depth/2 : depth/2) : 0;
+          edge.setAttribute('radius', edgeRadius);
+          edge.setAttribute('height', length);
+          edge.setAttribute('position', `${x} ${-height/2} ${z}`);
+          edge.setAttribute('rotation', isWidthEdge ? '0 0 90' : '0 90 90');
+          edge.setAttribute('material', `color: ${edgeColor}; opacity: ${opacity}`);
+          alignmentGuide.appendChild(edge);
+        }
+        
+        phoneModel.appendChild(alignmentGuide);
+        
+        // Store references for switching between solid and edge modes
+        phoneModel.solidBox = solidBox;
+        phoneModel.edgeGuide = alignmentGuide;
+
+        // Create calibration instruction panel
+        const calibrationButton = document.createElement('a-entity');
+        calibrationButton.setAttribute('text', {
+          value: 'Calibration: Press trigger, aim at phone, release\nTip: Recalibrate if offset occurs',
+          color: 'black',
+          align: 'left',
+          width: 0.7,
+          lineHeight: 70,
+          font: 'aileronsemibold'
+        });
+        calibrationButton.setAttribute('position', '0 1.6 -1');
+        calibrationButton.setAttribute('geometry', {
+          primitive: 'plane',
+          width: 0.8,
+          height: 0.15
+        });
+        calibrationButton.setAttribute('material', 'color: white');
+        calibrationButton.setAttribute('class', 'clickable');
+        calibrationButton.setAttribute('id', 'calibration-button');
+        sceneEl.appendChild(calibrationButton);
+
+        // Add click interaction for VR controller
+        sceneEl.addEventListener('enter-vr', () => {
+          console.log('Entered VR mode, setting up raycaster');
+          // Add raycaster for VR mode
+          const rightHand = document.querySelector('#right-controller');
+          if (rightHand) {
+            rightHand.setAttribute('raycaster', {
+              showLine: false,
+              far: 10,
+              lineColor: '#FFFFFF',
+              lineOpacity: 0.5
+            });
+            rightHand.setAttribute('cursor', {
+              rayOrigin: 'mouse'
+            });
+          }
+        });
+
+        // Add click event handler
+        setTimeout(() => {
+          const calibBtn = document.querySelector('#calibration-button');
+          if (calibBtn) {
+            calibBtn.addEventListener('click', startCalibration);
+            console.log('Calibration button click handler attached');
+          }
+        }, 1000); // Short delay to ensure element is added to DOM
+      } else {
+        console.log('Setting up Phone device');
+
+        // Phone device: Basic position tracking only
+        const statusText = document.createElement('a-entity');
+        statusText.setAttribute('text', {
+          value: 'Phone Mode Active\nSending position data...',
+          color: 'white',
+          align: 'center',
+          width: 1
+        });
+        statusText.setAttribute('position', '0 1.6 -1');
+        sceneEl.appendChild(statusText);
+      }
+
+      // Initialization complete, establish Socket.IO connection
+      initWebSocket();
+    }
+
+    // Start app - called after user selects device type
+    function startApp(deviceType) {
+      isQuest = deviceType === 'quest';
+      deviceSelected = true;
+      console.log(`Starting app as ${deviceType}`);
+
+      // Hide selection screen
+      const overlay = document.getElementById('overlay');
+      if (overlay) {
+        overlay.style.display = 'none';
+      }
+
+      initDevice();
+    }
+
+    // Start calibration process
+    function startCalibration() {
+      if (!isQuest || !connected || !deviceSelected) return;
+      
+      console.log('Starting calibration...');
+      calibrationMode = true;
+      showStatus('Starting calibration...');
+
+      // Prompt user to place phone on controller
+      const calibrationText = document.createElement('a-entity');
+      calibrationText.setAttribute('text', {
+        value: 'Phone model will follow controller\nRelease trigger to complete calibration',
+        color: 'red',
+        align: 'center',
+        width: 1
+      });
+      calibrationText.setAttribute('position', '0 1.8 -1');
+      calibrationText.setAttribute('id', 'calibration-text');
+      document.querySelector('a-scene').appendChild(calibrationText);
+
+      // Reset phone model state and show it following controller
+      if (phoneModel) {
+        // Clear previous transformation matrix to prevent old calibration from interfering
+        transformMatrix = null;
+        
+        // Reset any previous transformation matrix effects
+        phoneModel.object3D.position.set(0, 0, 0);
+        phoneModel.object3D.quaternion.set(0, 0, 0, 1);
+        phoneModel.setAttribute('visible', true);
+        
+        // Switch to solid box during calibration
+        if (phoneModel.solidBox && phoneModel.edgeGuide) {
+          phoneModel.solidBox.setAttribute('visible', true);
+          phoneModel.edgeGuide.setAttribute('visible', false);
+        }
+        
+        startRealTimeTracking();
+      }
+
+      // Listen for controller trigger button release
+      if (controllerEl) {
+        controllerEl.addEventListener('triggerup', completeCalibration);
+      } else {
+        console.error('Controller element not found');
+      }
+    }
+
+    // Start real-time tracking during calibration
+    function startRealTimeTracking() {
+      if (!calibrationMode || !controllerEl || !phoneModel) return;
+      
+      // Create tracking interval
+      window.calibrationTrackingInterval = setInterval(() => {
+        if (!calibrationMode) {
+          clearInterval(window.calibrationTrackingInterval);
+          return;
+        }
+        
+        // Get controller position and rotation
+        const controllerPosition = controllerEl.object3D.position.clone();
+        const controllerQuaternion = controllerEl.object3D.quaternion.clone();
+        
+        // Apply rotation to make phone model lie flat on controller (parallel orientation)
+        // Rotate 90 degrees around X-axis to make it horizontal
+        const flatRotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+        const finalQuaternion = controllerQuaternion.clone().multiply(flatRotation);
+        
+        // Update phone model to follow controller
+        phoneModel.setAttribute('position', {
+          x: controllerPosition.x,
+          y: controllerPosition.y,
+          z: controllerPosition.z
+        });
+        
+        phoneModel.object3D.quaternion.copy(finalQuaternion);
+      }, 16); // ~60fps
+    }
+
+    // Complete calibration
+    function completeCalibration() {
+      if (!calibrationMode || !connected) return;
+      
+      console.log('Completing calibration...');
+      showStatus('Completing calibration...');
+
+      // Stop real-time tracking
+      if (window.calibrationTrackingInterval) {
+        clearInterval(window.calibrationTrackingInterval);
+        window.calibrationTrackingInterval = null;
+      }
+
+      // Switch back to edge guide when trigger is released
+      if (phoneModel && phoneModel.solidBox && phoneModel.edgeGuide) {
+        phoneModel.solidBox.setAttribute('visible', false);
+        phoneModel.edgeGuide.setAttribute('visible', true);
+      }
+
+      // Remove the triggerup event listener
+      if (controllerEl) {
+        controllerEl.removeEventListener('triggerup', completeCalibration);
+      }
+
+      // Request phone to send current position data
+      socket.emit('request-calibration');
+    }
+
+    // Send phone position data (phone mode)
+    function sendPhonePosition() {
+      if (isQuest || !connected || !deviceSelected) return;
+
+      // Get current position and orientation of phone
+      const camera = document.querySelector('a-camera');
+      if (!camera) return;
+
+      const position = camera.object3D.position;
+      const rotation = new THREE.Euler().setFromQuaternion(camera.object3D.quaternion);
+
+      socket.emit('phone-position', {
+        position: {
+          x: position.x,
+          y: position.y,
+          z: position.z
+        },
+        rotation: {
+          x: rotation.x,
+          y: rotation.y,
+          z: rotation.z
+        },
+        timestamp: Date.now()
+        // Also send via WebRTC
+      });
+      sendPhonePositionWebRTC();
+    }
+    
+    // A-Frame component registration
+    AFRAME.registerComponent('space-sync', {
+      init: function() {
+        console.log('Space sync component initialized');
+        setInterval(() => {
+          // If device has not been selected, do not perform any actions
+          if (!deviceSelected) return;
+
+          // If phone mode, send position data (approximately 30 times per second)
+          if (!isQuest && connected ) {
+          sendPhonePosition();
+        }
+        }, 20);
+      },
+      
+      // tick: function(time) {
+      //   // If device has not been selected, do not perform any actions
+      //   if (!deviceSelected) return;
+
+      //   // If phone mode, send position data (approximately 30 times per second)
+      //   if (!isQuest && connected ) {
+      //     sendPhonePosition();
+      //   }
+      // }
+    });
+
+    // let frameCount = 0;
+    // let lastFpsLog = performance.now();
+
+    // AFRAME.registerComponent('fps-debug', {
+    //   tick: function () {
+    //     frameCount++;
+    //     const now = performance.now();
+    //     if (now - lastFpsLog >= 1000) {
+    //       console.log(`Current FPS: ${frameCount}`);
+    //       frameCount = 0;
+    //       lastFpsLog = now;
+    //     }
+    //   }
+    // });
+
+    // Raycaster interaction component
+    AFRAME.registerComponent('clickable', {
+      init: function() {
+        
+        this.el.addEventListener('click', function(evt) {
+          console.log('Clickable element clicked:', this.getAttribute('id'));
+          const id = this.getAttribute('id');
+          if (id === 'calibration-button') {
+            startCalibration();
+          }
+          
+        });
+      }
+    });
+
+    // Initial setup interface
+    document.addEventListener('DOMContentLoaded', function() {
+      // Get room ID from URL
+      const urlParams = new URLSearchParams(window.location.search);
+      roomId = urlParams.get('room');
+      
+      // If room ID exists in URL, display it
+      const roomIdDisplay = document.getElementById('room-id-display');
+      if (roomId && roomIdDisplay) {
+        roomIdDisplay.textContent = `Room ID: ${roomId}`;
+      } else if (roomIdDisplay) {
+        // Generate a new room ID
+        roomId = generateRoomId();
+        roomIdDisplay.textContent = `Room ID: ${roomId} (new)`;
+      }
+
+      // Device selection button event handlers
+      document.getElementById('device-select-phone').addEventListener('click', function() {
+        currentDevice = 'phone';
+        startApp('phone');
+        document.getElementById('status-container').style.display = 'block';
+      });
+      
+      document.getElementById('device-select-quest').addEventListener('click', function() {
+        currentDevice = 'quest';
+        startApp('quest');
+        document.getElementById('status-container').style.display = 'block';
+      });
+
+      // Now it's not always showing the two rectangles
+      const overlay = document.getElementById('overlay');
+      overlay.style.display = 'flex';
+
+      // DOM overlay controls
+      const domOverlay = document.getElementById('dom-overlay');
+      const closeBrowser = document.getElementById('close-browser');
+      const scene = document.querySelector('a-scene');
+      let currentDevice = null;
+
+      // Show DOM overlay when entering AR mode (for both Quest and Phone)
+      scene.addEventListener('enter-vr', function() {
+        console.log('Entering AR mode, showing DOM overlay');
+        // For WebXR DOM overlay, show immediately without delay
+        domOverlay.classList.add('show');
+      });
+
+      // Hide DOM overlay when exiting AR mode (only for Quest, not for phone)
+      scene.addEventListener('exit-vr', function() {
+        console.log('Exiting AR mode');
+        if (currentDevice === 'quest') {
+          console.log('Hiding DOM overlay for Quest device');
+          domOverlay.classList.remove('show');
+        } else {
+          console.log('Keeping DOM overlay visible for phone device');
+        }
+      });
+
+      // Close browser button functionality
+      closeBrowser.addEventListener('click', function() {
+        domOverlay.classList.remove('show');
+      });
+    });
+  </script>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+    }
+    #overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.8);
+      color: white;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    #qr-container {
+      position: fixed;
+      bottom: 10px;
+      right: 10px;
+      background: white;
+      padding: 10px;
+      border-radius: 5px;
+      z-index: 9999;
+    }
+    .button {
+      padding: 15px 30px;
+      margin: 15px;
+      background: #4285f4;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 18px;
+      transition: all 0.3s ease;
+    }
+    .button:hover {
+      background: #3367d6;
+      transform: scale(1.05);
+    }
+    #room-id-display {
+      font-size: 24px;
+      font-weight: bold;
+      margin: 20px 0;
+    }
+    #status-container {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 10px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      z-index: 999;
+    }
+    #dom-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      pointer-events: auto;
+      z-index: 999999;
+      background: rgba(0,0,0,0.1);
+      display: none !important;
+      contain: strict;
+      isolation: isolate;
+    }
+    
+    #dom-overlay.show {
+      display: block !important;
+    }
+    #web-browser {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: white;
+      border-radius: 0;
+      box-shadow: none;
+      overflow: hidden;
+    }
+    #browser-header {
+      background: #4285f4;
+      color: white;
+      padding: 10px 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: bold;
+    }
+    #close-browser {
+      background: none;
+      border: none;
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+      padding: 0;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #close-browser:hover {
+      background: rgba(255,255,255,0.2);
+    }
+    #web-frame {
+      width: 100%;
+      height: calc(100vh - 50px);
+      border: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- Device selection overlay, always displayed until device is selected -->
+  <div id="overlay">
+    <h2>XR Space Synchronization Demo</h2>
+    <p>Select your device type to continue:</p>
+    <div>
+      <button id="device-select-phone" class="button">I'm using a Phone</button>
+      <button id="device-select-quest" class="button">I'm using Quest</button>
+    </div>
+    <div id="room-id-display"></div>
+    <p>Share the same Room ID on both devices to sync them.</p>
+  </div>
+
+  <!-- Status display area, visible after device selection -->
+  <div id="status-container" style="display: none;">
+    <h4 id="status-title">Status</h4>
+    <p id="status-message">Waiting for device selection...</p>
+  </div>
+
+  <!-- DOM Overlay for AR mode -->
+  <div id="dom-overlay">
+    <div id="web-browser">
+      <div id="browser-header">
+        <span>Wikipedia - AR Browser</span>
+        <button id="close-browser">×</button>
+      </div>
+      <iframe id="web-frame" src="https://en.wikipedia.org/wiki/Main_Page" frameborder="0"></iframe>
+    </div>
+  </div>
+  
+  <a-scene space-sync fps-debug xr-mode-ui="enabled: true; XRMode: ar" 
+    webxr="requiredFeatures: hit-test,local-floor; overlayElement: #dom-overlay;">
+    <a-entity id="rig" position="0 0 0">
+      <a-camera id="camera"></a-camera>
+    </a-entity>
+
+    <!-- Environment -->
+    <a-entity light="type: ambient; color: #BBB"></a-entity>
+    <a-entity light="type: directional; color: #FFF; intensity: 0.6" position="-0.5 1 1"></a-entity>
+    <a-grid position="0 0 0" rotation="-90 0 0" width="10" height="10" color="#666"></a-grid>
+    
+  </a-scene>
+  
+ 
+</body>
+</html>
