@@ -1,6 +1,7 @@
 *.pem
 
 .env
+.vscode/
 
 node_modules/
 Server/node_modules/
