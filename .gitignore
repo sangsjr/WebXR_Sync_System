@@ -1,0 +1,6 @@
+*.pem
+
+.env
+
+node_modules/
+Server/node_modules/
