@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+Quest/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -50,6 +51,7 @@ temp/
 
 # Certificate files
 *.pem
+Server/*.pem
 
 # Excel files
 *.xlsx
