@@ -47,3 +47,13 @@ coverage/
 # Temporary folders
 tmp/
 temp/
+
+# Certificate files
+*.pem
+
+# Excel files
+*.xlsx
+*.xls
+
+# Package lock files
+package-lock.json
